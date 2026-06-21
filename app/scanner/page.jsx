@@ -56,21 +56,17 @@ export default function ScannerPage() {
   // Refs
   const html5QrRef = useRef(null);
 
-  // ── Enumerate cameras on mount ─────────────────────────────────────────────
+  // ── Cleanup on unmount ─────────────────────────────────────────────────────
   useEffect(() => {
-    const enumerate = async () => {
-      try {
-        if (!navigator.mediaDevices?.enumerateDevices) return;
-        // Ask permission first so labels are populated
-        await navigator.mediaDevices.getUserMedia({ video: true }).then(s => s.getTracks().forEach(t => t.stop())).catch(() => {});
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        const vCams = devices.filter(d => d.kind === 'videoinput');
-        setCameras(vCams);
-        if (vCams.length > 0) setSelectedCameraId(vCams[0].deviceId);
-      } catch { /* ignore */ }
+    return () => {
+      if (html5QrRef.current) {
+        try {
+          if (html5QrRef.current.isScanning) {
+            html5QrRef.current.stop().catch(() => {});
+          }
+        } catch { /* ignore */ }
+      }
     };
-    enumerate();
-    return () => stopScanner();
   }, []);
 
   // ── Core scan handler — called by both QR reader callback and manual submit ─
@@ -225,10 +221,17 @@ export default function ScannerPage() {
   }
 
   // ── Camera controls ────────────────────────────────────────────────────────
-  const startScanner = async () => {
+  const startScanner = async (deviceIdToStart = null) => {
     setCameraStatus('starting');
     setCameraError('');
     setScanResult(null);
+
+    // Insecure context check
+    if (typeof window !== 'undefined' && !window.isSecureContext && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+      setCameraError('Kamera hanya bisa digunakan di localhost atau HTTPS.');
+      setCameraStatus('error');
+      return;
+    }
 
     try {
       if (!navigator.mediaDevices?.getUserMedia) {
@@ -236,16 +239,40 @@ export default function ScannerPage() {
       }
 
       const { Html5Qrcode } = await import('html5-qrcode');
-      const qr = new Html5Qrcode('qr-reader-div');
+
+      // Get list of available cameras
+      let devices = [];
+      try {
+        devices = await Html5Qrcode.getCameras();
+        setCameras(devices);
+      } catch (camErr) {
+        console.warn('Gagal mendapatkan list kamera:', camErr);
+      }
+
+      // Determine which device to use
+      let deviceId = deviceIdToStart || selectedCameraId;
+      if (devices.length > 0) {
+        const exists = devices.some(d => d.id === deviceId);
+        if (!deviceId || !exists) {
+          deviceId = devices[0].id;
+          setSelectedCameraId(devices[0].id);
+        }
+      }
+
+      const qr = new Html5Qrcode('qr-reader');
       html5QrRef.current = qr;
 
-      const cameraConfig = selectedCameraId
-        ? { deviceId: { exact: selectedCameraId } }
+      const cameraConfig = deviceId
+        ? { deviceId: { exact: deviceId } }
         : { facingMode: 'environment' };
 
       await qr.start(
         cameraConfig,
-        { fps: 10, qrbox: { width: 240, height: 240 }, aspectRatio: 1.0 },
+        {
+          fps: 10,
+          qrbox: { width: 240, height: 240 },
+          aspectRatio: 1.0,
+        },
         (decodedText) => {
           // QR berhasil terbaca — panggil handler
           handleScanResult(decodedText, null, false);
@@ -255,20 +282,31 @@ export default function ScannerPage() {
 
       setCameraStatus('active');
     } catch (err) {
+      console.error('Error starting camera:', err);
       let msg = 'Gagal mengaktifkan kamera.';
-      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-        msg = 'Izin kamera ditolak. Klik ikon kunci di address bar dan izinkan akses kamera.';
-      } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
-        msg = 'Kamera tidak ditemukan. Pastikan webcam sudah terpasang dan tidak digunakan aplikasi lain.';
-      } else if (err.name === 'NotSupportedError') {
-        msg = 'Browser tidak mendukung akses kamera. Gunakan Chrome, Firefox, atau Edge versi terbaru via HTTPS.';
-      } else if (err.name === 'NotReadableError' || err.name === 'TrackStartError') {
-        msg = 'Kamera sedang digunakan aplikasi lain. Tutup aplikasi lain yang menggunakan kamera dan coba lagi.';
+      if (typeof window !== 'undefined' && !window.isSecureContext && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+        msg = 'Kamera hanya bisa digunakan di localhost atau HTTPS.';
+      } else {
+        const name = err.name || '';
+        const message = err.message || '';
+        if (name === 'NotAllowedError' || name === 'PermissionDeniedError' || message.includes('denied') || message.includes('dismissed')) {
+          msg = 'Izin kamera ditolak. Aktifkan izin kamera di browser.';
+        } else if (name === 'NotFoundError' || name === 'DevicesNotFoundError' || message.includes('found')) {
+          msg = 'Kamera tidak ditemukan.';
+        } else if (name === 'NotReadableError' || name === 'TrackStartError' || message.includes('readable') || message.includes('use')) {
+          msg = 'Kamera sedang digunakan aplikasi lain.';
+        } else if (name === 'NotSupportedError') {
+          msg = 'Browser tidak mendukung akses kamera. Gunakan Chrome, Firefox, atau Edge versi terbaru via HTTPS.';
+        }
       }
       setCameraError(msg);
       setCameraStatus('error');
       if (html5QrRef.current) {
-        try { await html5QrRef.current.stop(); } catch { /* ignore */ }
+        try {
+          if (html5QrRef.current.isScanning) {
+            await html5QrRef.current.stop();
+          }
+        } catch { /* ignore */ }
         html5QrRef.current = null;
       }
     }
@@ -278,11 +316,18 @@ export default function ScannerPage() {
     if (html5QrRef.current) {
       try {
         await html5QrRef.current.stop();
-        html5QrRef.current.clear();
       } catch { /* ignore */ }
       html5QrRef.current = null;
     }
     setCameraStatus('idle');
+  };
+
+  const handleCameraChange = async (deviceId) => {
+    setSelectedCameraId(deviceId);
+    if (cameraStatus === 'active') {
+      await stopScanner();
+      await startScanner(deviceId);
+    }
   };
 
   // ── Manual input submit ────────────────────────────────────────────────────
@@ -410,12 +455,12 @@ export default function ScannerPage() {
                   id="select-camera"
                   className="form-select"
                   value={selectedCameraId}
-                  onChange={e => setSelectedCameraId(e.target.value)}
-                  disabled={isActive || isStarting}
+                  onChange={e => handleCameraChange(e.target.value)}
+                  disabled={isStarting}
                   style={{ fontSize: '12px', padding: '5px 8px', flex: 1 }}
                 >
                   {cameras.map((cam, i) => (
-                    <option key={cam.deviceId} value={cam.deviceId}>
+                    <option key={cam.id} value={cam.id}>
                       {cam.label || `Kamera ${i + 1}`}
                     </option>
                   ))}
@@ -427,7 +472,7 @@ export default function ScannerPage() {
             <div
               className="scanner-viewport"
               style={{
-                minHeight: 420,
+                minHeight: 360,
                 flex: 1,
                 borderColor: isActive
                   ? (mode === 'masuk' ? 'rgba(6,214,160,0.5)' : 'rgba(239,68,68,0.5)')
@@ -442,81 +487,105 @@ export default function ScannerPage() {
                 }} />
               )}
 
-              {/* QR reader mount point — always rendered, shown/hidden via CSS */}
+              {/* QR reader mount point — ALWAYS rendered and visible in layout, never display:none during init */}
               <div
-                id="qr-reader-div"
+                id="qr-reader"
                 style={{
                   width: '100%',
                   height: '100%',
-                  display: isActive ? 'block' : 'none',
+                  minHeight: '360px',
                   borderRadius: 'var(--radius-lg)',
                   overflow: 'hidden',
                 }}
               />
 
-              {/* Idle state */}
-              {cameraStatus === 'idle' && (
-                <div className="scanner-idle">
-                  <div className="scanner-idle-icon">📷</div>
-                  <p style={{ fontSize: '14px', fontWeight: 600, color: 'var(--color-text-secondary)' }}>
-                    Kamera Tidak Aktif
-                  </p>
-                  <p style={{ maxWidth: 240 }}>
-                    Tekan tombol di bawah untuk mengaktifkan webcam dan mulai scan KTM.
-                  </p>
-                  <button
-                    id="btn-start-scan"
-                    className={`btn btn-lg ${mode === 'masuk' ? 'btn-success' : 'btn-danger'}`}
-                    onClick={startScanner}
-                    style={{ marginTop: 14 }}
-                  >
-                    📷 Aktifkan Kamera & Mulai Scan
-                  </button>
-                </div>
-              )}
+              {/* Overlay for Idle, Starting, and Error states */}
+              {cameraStatus !== 'active' && (
+                <div style={{
+                  position: 'absolute',
+                  inset: 0,
+                  background: 'var(--color-surface)',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  padding: '20px',
+                  zIndex: 5,
+                  borderRadius: 'var(--radius-lg)',
+                }}>
+                  {/* Idle state */}
+                  {cameraStatus === 'idle' && (
+                    <div className="scanner-idle">
+                      <div className="scanner-idle-icon">📷</div>
+                      <p style={{ fontSize: '14px', fontWeight: 600, color: 'var(--color-text-secondary)' }}>
+                        Preview kamera akan muncul di sini.
+                      </p>
+                      <p style={{ maxWidth: 240, fontSize: '12px' }}>
+                        Tekan tombol di bawah untuk mengaktifkan webcam dan mulai scan KTM.
+                      </p>
+                      <button
+                        id="btn-start-scan"
+                        className={`btn btn-lg ${mode === 'masuk' ? 'btn-success' : 'btn-danger'}`}
+                        onClick={() => startScanner()}
+                        style={{ marginTop: 14 }}
+                      >
+                        📷 Mulai Kamera
+                      </button>
+                    </div>
+                  )}
 
-              {/* Starting spinner */}
-              {isStarting && (
-                <div className="scanner-idle">
-                  <span style={{ fontSize: 36, animation: 'spin 1s linear infinite', display: 'inline-block' }}>⟳</span>
-                  <p style={{ fontSize: 13, color: 'var(--color-text-secondary)' }}>Mengaktifkan kamera...</p>
-                </div>
-              )}
+                  {/* Starting spinner */}
+                  {isStarting && (
+                    <div className="scanner-idle">
+                      <span style={{ fontSize: 36, animation: 'spin 1s linear infinite', display: 'inline-block', color: 'var(--color-primary)' }}>⟳</span>
+                      <p style={{ fontSize: 13, color: 'var(--color-text-secondary)', fontWeight: 600 }}>Mengaktifkan kamera...</p>
+                      <p style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>Mencoba mengakses webcam Anda</p>
+                    </div>
+                  )}
 
-              {/* Error state */}
-              {cameraStatus === 'error' && (
-                <div className="scanner-idle">
-                  <div className="scanner-idle-icon" style={{ opacity: 1, fontSize: 42 }}>🚫</div>
-                  <p style={{ fontSize: 14, fontWeight: 600, color: 'var(--color-danger)', maxWidth: 300, textAlign: 'center' }}>
-                    {cameraError}
-                  </p>
-                  <button
-                    id="btn-retry-camera"
-                    className="btn btn-secondary"
-                    onClick={startScanner}
-                    style={{ marginTop: 14 }}
-                  >
-                    🔄 Mulai Kamera Ulang
-                  </button>
-                  <button
-                    id="btn-manual-from-error"
-                    className="btn btn-ghost btn-sm"
-                    onClick={() => setManualMode(true)}
-                    style={{ marginTop: 6 }}
-                  >
-                    ✏️ Gunakan Input Manual
-                  </button>
+                  {/* Error state */}
+                  {cameraStatus === 'error' && (
+                    <div className="scanner-idle">
+                      <div className="scanner-idle-icon" style={{ opacity: 1, fontSize: 42 }}>🚫</div>
+                      <p style={{ fontSize: 14, fontWeight: 600, color: 'var(--color-danger)', maxWidth: 300, textAlign: 'center' }}>
+                        {cameraError}
+                      </p>
+                      <button
+                        id="btn-retry-camera"
+                        className="btn btn-secondary"
+                        onClick={() => startScanner()}
+                        style={{ marginTop: 14 }}
+                      >
+                        🔄 Coba Lagi
+                      </button>
+                      <button
+                        id="btn-manual-from-error"
+                        className="btn btn-ghost btn-sm"
+                        onClick={() => setManualMode(true)}
+                        style={{ marginTop: 6 }}
+                      >
+                        ✏️ Scan Manual (Input)
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
 
               {/* Processing overlay */}
-              {isProcessing && isActive && (
+              {isProcessing && (
                 <div style={{
-                  position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.55)',
-                  borderRadius: 'var(--radius-lg)', display: 'flex', alignItems: 'center',
-                  justifyContent: 'center', flexDirection: 'column', gap: 10, zIndex: 10,
+                  position: 'absolute',
+                  inset: 0,
+                  background: 'rgba(0,0,0,0.7)',
+                  borderRadius: 'var(--radius-lg)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  flexDirection: 'column',
+                  gap: 10,
+                  zIndex: 10,
                 }}>
-                  <span style={{ fontSize: 32, animation: 'spin 0.8s linear infinite', display: 'inline-block' }}>⟳</span>
+                  <span style={{ fontSize: 32, animation: 'spin 0.8s linear infinite', display: 'inline-block', color: 'var(--color-primary)' }}>⟳</span>
                   <span style={{ fontSize: 13, color: 'white', fontWeight: 600 }}>Menyimpan ke Spreadsheet...</span>
                 </div>
               )}
@@ -531,17 +600,17 @@ export default function ScannerPage() {
                   onClick={stopScanner}
                   style={{ flex: 1, justifyContent: 'center' }}
                 >
-                  ⏹ Hentikan Scanner
+                  ⏹ Hentikan Kamera
                 </button>
               ) : (
                 cameraStatus !== 'starting' && (
                   <button
                     id="btn-start-scan-bottom"
                     className={`btn ${mode === 'masuk' ? 'btn-success' : 'btn-danger'}`}
-                    onClick={startScanner}
+                    onClick={() => startScanner()}
                     style={{ flex: 1, justifyContent: 'center' }}
                   >
-                    📷 {cameraStatus === 'error' ? 'Coba Lagi' : 'Mulai Scan'}
+                    📷 Mulai Kamera
                   </button>
                 )
               )}
@@ -550,7 +619,7 @@ export default function ScannerPage() {
                 className="btn btn-secondary"
                 onClick={() => setManualMode(true)}
               >
-                ✏️ Input Manual
+                ✏️ Scan Manual
               </button>
             </div>
 
